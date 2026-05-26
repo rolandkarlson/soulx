@@ -15,6 +15,8 @@ export DEBIAN_FRONTEND=noninteractive
 WORKSPACE="${WORKSPACE:-/workspace}"
 ENGINE_DIR="${ENGINE_DIR:-${WORKSPACE}/SoulX-Singer}"
 SERVER_PATH="${SERVER_PATH:-${WORKSPACE}/server.py}"
+INFERENCE_SERVE_PATH="${INFERENCE_SERVE_PATH:-${WORKSPACE}/inference_serve.py}"
+INFER_STEPS="${INFER_STEPS:-64}"
 PORT="${PORT:-8000}"
 SOULX_DEVICE="${SOULX_DEVICE:-cuda}"
 SOULX_REPO_URL="${SOULX_REPO_URL:-https://github.com/Soul-AILab/SoulX-Singer.git}"
@@ -83,6 +85,24 @@ if ! "${PYTHON_BIN}" -m py_compile "${SERVER_PATH}"; then
   die "server.py has syntax errors. Make sure it also has real line breaks in GitHub."
 fi
 
+# inference_serve.py is the persistent SoulX worker. It is NOT part of upstream
+# SoulX-Singer, so it must be shipped separately and copied into the clone's
+# cli/ package below.
+if [ -n "${INFERENCE_SERVE_URL:-}" ]; then
+  log "fetching inference_serve.py from ${INFERENCE_SERVE_URL}"
+  curl -fsSL "${INFERENCE_SERVE_URL}" -o "${INFERENCE_SERVE_PATH}"
+fi
+
+if [ ! -f "${INFERENCE_SERVE_PATH}" ]; then
+  die "${INFERENCE_SERVE_PATH} missing. Set INFERENCE_SERVE_URL or place inference_serve.py in ${WORKSPACE}."
+fi
+
+log "checking inference_serve.py syntax"
+
+if ! "${PYTHON_BIN}" -m py_compile "${INFERENCE_SERVE_PATH}"; then
+  die "inference_serve.py has syntax errors. Make sure it also has real line breaks in GitHub."
+fi
+
 log "cloning SoulX-Singer"
 
 if [ ! -d "${ENGINE_DIR}/.git" ]; then
@@ -93,6 +113,17 @@ else
 fi
 
 cd "${ENGINE_DIR}"
+
+log "installing inference_serve.py into cli/"
+mkdir -p "${ENGINE_DIR}/cli"
+cp "${INFERENCE_SERVE_PATH}" "${ENGINE_DIR}/cli/inference_serve.py"
+
+# Match the local quality setting (upstream default is n_steps: 32).
+CONFIG_YAML="${ENGINE_DIR}/soulxsinger/config/soulxsinger.yaml"
+if [ -f "${CONFIG_YAML}" ]; then
+  log "setting infer n_steps to ${INFER_STEPS}"
+  sed -i -E "s/^([[:space:]]*)n_steps:[[:space:]]*[0-9]+/\1n_steps: ${INFER_STEPS}/" "${CONFIG_YAML}" || true
+fi
 
 # The upstream requirements.txt may be accidentally stored as one long line.
 # pip expects one requirement per line, so normalize it safely.
