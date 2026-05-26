@@ -34,6 +34,7 @@ apt-get install -y --no-install-recommends \
   curl \
   ca-certificates \
   ffmpeg \
+  build-essential \
   python3 \
   python3-venv \
   python3-dev \
