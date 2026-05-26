@@ -1,8 +1,10 @@
 """FastAPI wrapper around SoulX-Singer's cli.inference_serve worker.
 
-Mirrors the JSONL stdin/stdout protocol that synth.py._SoulxWorker speaks
-locally: one long-lived python3.10 subprocess owns the GPU model, this server
-serializes inference jobs onto it.
+One long-lived python3.10 subprocess owns the GPU model. Inference is async:
+POST /synthesize enqueues a job and returns a job_id immediately; the client
+polls GET /jobs/{id} and downloads GET /jobs/{id}/result when done. This keeps
+every HTTP request short so RunPod's Cloudflare proxy never hits its ~100s
+origin timeout (error 524) on long renders.
 
 Run with:
     SOULX_REPO=/workspace/SoulX-Singer \
@@ -14,14 +16,18 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 
 
 SOULX_REPO = Path(os.environ["SOULX_REPO"]).resolve()
@@ -121,19 +127,53 @@ class SoulxWorker:
 app = FastAPI(title="SoulX-Singer Inference")
 worker = SoulxWorker()
 
+# Single-worker executor: inference is serialized anyway (one GPU, one worker
+# subprocess), and running it here keeps the blocking call off the event loop
+# so /jobs polls stay responsive while a render is in flight.
+_executor = ThreadPoolExecutor(max_workers=1)
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+
+
+def _set_job(job_id: str, **fields) -> None:
+    with _jobs_lock:
+        _jobs.setdefault(job_id, {}).update(fields)
+
+
+def _get_job(job_id: str) -> dict | None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        return dict(job) if job is not None else None
+
+
+def _run_job(job_id: str, infer_args: dict, tmp: Path) -> None:
+    _set_job(job_id, status="running")
+    try:
+        worker.infer(infer_args)
+        generated = Path(infer_args["save_dir"]) / "generated.wav"
+        if not generated.is_file():
+            raise RuntimeError(f"SoulX finished but {generated} missing.")
+        _set_job(job_id, status="done", wav_path=str(generated))
+    except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(tmp, ignore_errors=True)
+        _set_job(job_id, status="error", error=str(exc))
+
 
 @app.get("/healthz")
 def healthz() -> dict[str, object]:
+    with _jobs_lock:
+        active = sum(1 for j in _jobs.values() if j.get("status") in ("pending", "running"))
     return {
         "ok": True,
         "device": SOULX_DEVICE,
         "repo": str(SOULX_REPO),
         "model_present": MODEL_PATH.is_file(),
         "worker_running": worker.proc is not None and worker.proc.poll() is None,
+        "active_jobs": active,
     }
 
 
-@app.post("/synthesize")
+@app.post("/synthesize", status_code=202)
 async def synthesize(
     target_metadata: UploadFile = File(...),
     prompt_preset: str = Form("english"),
@@ -173,48 +213,70 @@ async def synthesize(
         save_dir = tmp / "out"
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
-            worker.infer({
-                "prompt_wav_path": str(prompt_wav_path),
-                "prompt_metadata_path": str(prompt_meta_path),
-                "target_metadata_path": str(target_path),
-                "phoneset_path": str(PHONESET_PATH),
-                "save_dir": str(save_dir),
-                "pitch_shift": pitch_shift,
-                "auto_shift": auto_shift,
-                "control": "score",
-            })
-        except RuntimeError as exc:
-            return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
-
-        generated = save_dir / "generated.wav"
-        if not generated.is_file():
-            return JSONResponse(
-                status_code=500,
-                content={"ok": False, "error": f"SoulX finished but {generated} missing."},
-            )
-
-        # FileResponse will stream the file; the temp dir is cleaned up by a
-        # background task after the response is sent.
-        return FileResponse(
-            path=str(generated),
-            media_type="audio/wav",
-            filename="generated.wav",
-            background=_cleanup_task(tmp),
-        )
+        infer_args = {
+            "prompt_wav_path": str(prompt_wav_path),
+            "prompt_metadata_path": str(prompt_meta_path),
+            "target_metadata_path": str(target_path),
+            "phoneset_path": str(PHONESET_PATH),
+            "save_dir": str(save_dir),
+            "pitch_shift": pitch_shift,
+            "auto_shift": auto_shift,
+            "control": "score",
+        }
     except HTTPException:
-        _rmtree(tmp)
+        shutil.rmtree(tmp, ignore_errors=True)
         raise
     except Exception:
-        _rmtree(tmp)
+        shutil.rmtree(tmp, ignore_errors=True)
         raise
 
+    job_id = uuid.uuid4().hex
+    _set_job(job_id, status="pending", error=None, wav_path=None, tmp=str(tmp))
+    _executor.submit(_run_job, job_id, infer_args, tmp)
+    return {"ok": True, "job_id": job_id, "status": "pending"}
 
-def _cleanup_task(path: Path):
-    from starlette.background import BackgroundTask
-    return BackgroundTask(_rmtree, path)
+
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str):
+    job = _get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": job.get("status"),
+        "error": job.get("error"),
+    }
 
 
-def _rmtree(path: Path) -> None:
-    import shutil
-    shutil.rmtree(path, ignore_errors=True)
+@app.get("/jobs/{job_id}/result")
+def job_result(job_id: str):
+    job = _get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    status = job.get("status")
+    if status == "error":
+        return JSONResponse(
+            status_code=500, content={"ok": False, "error": job.get("error")}
+        )
+    if status != "done":
+        # Not ready yet — tell the client to keep polling.
+        return JSONResponse(
+            status_code=409, content={"ok": False, "status": status}
+        )
+
+    wav_path = job.get("wav_path")
+    tmp = job.get("tmp")
+
+    def _cleanup() -> None:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+        with _jobs_lock:
+            _jobs.pop(job_id, None)
+
+    return FileResponse(
+        path=wav_path,
+        media_type="audio/wav",
+        filename="generated.wav",
+        background=BackgroundTask(_cleanup),
+    )
