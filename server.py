@@ -6,6 +6,9 @@ polls GET /jobs/{id} and downloads GET /jobs/{id}/result when done. This keeps
 every HTTP request short so RunPod's Cloudflare proxy never hits its ~100s
 origin timeout (error 524) on long renders.
 
+Finished renders are also kept under RENDERS_DIR and browsable at GET / with
+per-file download and a "Download all" zip.
+
 Run with:
     SOULX_REPO=/workspace/SoulX-Singer \
     SOULX_PYTHON=/workspace/SoulX-Singer/.venv/bin/python \
@@ -14,6 +17,8 @@ Run with:
 """
 from __future__ import annotations
 
+import datetime
+import html
 import json
 import os
 import shutil
@@ -22,17 +27,19 @@ import sys
 import tempfile
 import threading
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from starlette.background import BackgroundTask
 
 
 SOULX_REPO = Path(os.environ["SOULX_REPO"]).resolve()
 SOULX_PYTHON = os.environ["SOULX_PYTHON"]
 SOULX_DEVICE = os.environ.get("SOULX_DEVICE", "cuda")
+RENDERS_DIR = Path(os.environ.get("RENDERS_DIR", "/workspace/renders")).resolve()
 
 MODEL_PATH = SOULX_REPO / "pretrained_models" / "SoulX-Singer" / "model.pt"
 CONFIG_PATH = SOULX_REPO / "soulxsinger" / "config" / "soulxsinger.yaml"
@@ -153,10 +160,18 @@ def _run_job(job_id: str, infer_args: dict, tmp: Path) -> None:
         generated = Path(infer_args["save_dir"]) / "generated.wav"
         if not generated.is_file():
             raise RuntimeError(f"SoulX finished but {generated} missing.")
-        _set_job(job_id, status="done", wav_path=str(generated))
+        RENDERS_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        render_name = f"{stamp}-{job_id[:8]}.wav"
+        render_path = RENDERS_DIR / render_name
+        shutil.copy2(generated, render_path)
+        _set_job(job_id, status="done", wav_path=str(render_path), render_name=render_name)
     except Exception as exc:  # noqa: BLE001
-        shutil.rmtree(tmp, ignore_errors=True)
         _set_job(job_id, status="error", error=str(exc))
+    finally:
+        # The per-job working dir (uploads + raw output) is no longer needed;
+        # the finished render is preserved in RENDERS_DIR.
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @app.get("/healthz")
@@ -246,6 +261,7 @@ def job_status(job_id: str):
         "job_id": job_id,
         "status": job.get("status"),
         "error": job.get("error"),
+        "render_name": job.get("render_name"),
     }
 
 
@@ -261,22 +277,106 @@ def job_result(job_id: str):
         )
     if status != "done":
         # Not ready yet — tell the client to keep polling.
-        return JSONResponse(
-            status_code=409, content={"ok": False, "status": status}
-        )
+        return JSONResponse(status_code=409, content={"ok": False, "status": status})
 
     wav_path = job.get("wav_path")
-    tmp = job.get("tmp")
+    if not wav_path or not Path(wav_path).is_file():
+        raise HTTPException(status_code=410, detail="Render file no longer available")
+    return FileResponse(path=wav_path, media_type="audio/wav", filename="generated.wav")
 
-    def _cleanup() -> None:
-        if tmp:
-            shutil.rmtree(tmp, ignore_errors=True)
-        with _jobs_lock:
-            _jobs.pop(job_id, None)
 
+# --- Render browser ----------------------------------------------------------
+
+
+def _list_renders() -> list[Path]:
+    if not RENDERS_DIR.is_dir():
+        return []
+    files = [p for p in RENDERS_DIR.glob("*.wav") if p.is_file()]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return files
+
+
+def _safe_render(name: str) -> Path:
+    candidate = (RENDERS_DIR / name).resolve()
+    if candidate.parent != RENDERS_DIR or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Unknown render")
+    return candidate
+
+
+def _fmt_size(n: int) -> str:
+    return f"{n/1024:.0f} KB" if n < 1024 * 1024 else f"{n/1024/1024:.1f} MB"
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> str:
+    files = _list_renders()
+    rows = []
+    for p in files:
+        st = p.stat()
+        when = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        name = html.escape(p.name)
+        rows.append(
+            f"<tr><td><a href='/files/{name}'>{name}</a></td>"
+            f"<td>{_fmt_size(st.st_size)}</td><td>{when}</td>"
+            f"<td><a class='btn' href='/files/{name}' download>Download</a></td></tr>"
+        )
+    table = (
+        "<table><thead><tr><th>File</th><th>Size</th><th>Modified</th><th></th></tr>"
+        "</thead><tbody>" + "".join(rows) + "</tbody></table>"
+        if rows
+        else "<p class='empty'>No renders yet.</p>"
+    )
+    download_all = (
+        "<a class='btn primary' href='/download-all'>Download all (zip)</a>"
+        if rows
+        else ""
+    )
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>SoulX Renders</title>
+<style>
+  body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 860px;
+         margin: 40px auto; padding: 0 16px; color: #1a1a1a; }}
+  h1 {{ font-size: 1.4rem; }}
+  .bar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; }}
+  table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
+  th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid #e2e2e2;
+           font-size: 0.92rem; }}
+  th {{ color:#666; font-weight:600; }}
+  a {{ color: #2b6cb0; text-decoration: none; }}
+  .btn {{ display:inline-block; padding:5px 10px; border:1px solid #cbd5e0;
+         border-radius:6px; font-size:0.85rem; }}
+  .btn.primary {{ background:#2b6cb0; color:#fff; border-color:#2b6cb0; }}
+  .empty {{ color:#888; margin-top:24px; }}
+  .count {{ color:#888; font-size:0.9rem; }}
+</style></head>
+<body>
+  <div class="bar">
+    <h1>SoulX Renders <span class="count">({len(files)})</span></h1>
+    {download_all}
+  </div>
+  {table}
+</body></html>"""
+
+
+@app.get("/files/{name}")
+def download_file(name: str):
+    path = _safe_render(name)
+    return FileResponse(path=str(path), media_type="audio/wav", filename=path.name)
+
+
+@app.get("/download-all")
+def download_all():
+    files = _list_renders()
+    if not files:
+        raise HTTPException(status_code=404, detail="No renders to download")
+    tmp = Path(tempfile.mkdtemp(prefix="soulx-zip-"))
+    zip_path = tmp / "soulx_renders.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+        for p in files:
+            zf.write(p, arcname=p.name)
     return FileResponse(
-        path=wav_path,
-        media_type="audio/wav",
-        filename="generated.wav",
-        background=BackgroundTask(_cleanup),
+        path=str(zip_path),
+        media_type="application/zip",
+        filename="soulx_renders.zip",
+        background=BackgroundTask(shutil.rmtree, tmp, ignore_errors=True),
     )
